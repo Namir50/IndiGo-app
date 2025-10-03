@@ -4,6 +4,7 @@ import asyncio
 from dotenv import load_dotenv
 from flask import Flask, request, render_template
 
+load_dotenv()
 
 # ==== CONFIG ====
 MIDJOURNEY_API_KEY = os.getenv("MIDJOURNEY_API_KEY")
