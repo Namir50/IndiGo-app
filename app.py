@@ -1,96 +1,70 @@
 import os
-import httpx
-import asyncio
-from dotenv import load_dotenv
 from flask import Flask, request, render_template
+from google import genai
+from google.genai import types
+from PIL import Image
+from io import BytesIO
+from dotenv import load_dotenv
 
+# Load API keys
 load_dotenv()
 
-# ==== CONFIG ====
-MIDJOURNEY_API_KEY = os.getenv("MIDJOURNEY_API_KEY")
-UPLOAD_FOLDER = "inputs"
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
-BASE_PROMPT = """An ultra-realistic, cinematic wide-angle photograph of a full-body skydiver diving out of a Saab 105 jet painted in IndiGo Airlines livery. 
-              The IndiGo Airlines Saab 105 airplane is clearly visible in the same frame, positioned above and behind the diver. 
-              The plane’s side passenger door is wide open, showing the exit point from which the diver just leapt, with sharp details of the open hatch, metallic textures, and the IndiGo logo and blue-and-white branding clearly visible along the fuselage. 
-              The diver is captured in the foreground, entire body in frame, mid-dive in free fall with arms spread wide and legs extended dynamically against the wind. 
-              He is not wearing a helmet his face is unobstructed, vividly showing an excited, adrenaline-filled expression of pure thrill and joy, eyes wide open and mouth smiling in exhilaration. 
-              His hair is windswept, reacting naturally to the high-speed dive. His skin shows hyper-realistic detail visible pores, fine textures, and subtle imperfections enhanced by daylight HDR lighting. 
-              The skydiving suit is a custom IndiGo Airlines jumpsuit in deep indigo blue with precise airline logos, livery patterns, and aerodynamic seams. The fabric appears thick and durable, with realistic folds and creases, rippling in the wind to emphasize motion. Light glints off metallic buckles and straps, adding authenticity. 
-              The surrounding sky is bright and expansive, scattered with realistic fluffy white clouds, rendered with volumetric lighting. Subtle motion blur on the clouds and background sky conveys the immense speed and altitude of the dive, while the foreground diver remains sharply in focus. 
-              The entire composition is cinematic and dramatic, balancing the diver in the foreground and the IndiGo Saab 105 aircraft with its open door in the background. 
-              Photographed as if shot on an Arri Alexa 65 using a 35mm wide-angle lens, full HDR cinematic realism, natural daylight illumination, wide-body framing, hyper-detailed textures, 16:9 aspect ratio."""
+# Folders
+UPLOAD_FOLDER = "inputs"
+OUTPUT_FOLDER = "outputs/images"
+LOGO_PATH = "assets/indigo_logo.png"
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# ==== FLASK APP ====
 app = Flask(__name__)
 
-# -------- MidJourney API Wrapper --------
-class MidjourneyAPI:
-    def __init__(self, api_key):
-        self.base_url = "https://api.piapi.ai/api/v1"
-        self.headers = {"x-api-key": api_key, "Content-Type": "application/json"}
-
-    async def create_task(self, prompt, image_ref, aspect_ratio="16:9"):
-        payload = {
-            "model": "midjourney",
-            "task_type": "imagine",
-            "input": {
-                "prompt": prompt,
-                "aspect_ratio": aspect_ratio,
-                "process_mode": "turbo",
-                "skip_prompt_check": False,
-                "image_references": [image_ref]  # 👈 Add user selfie
-            }
-        }
-        async with httpx.AsyncClient() as client:
-            r = await client.post(f"{self.base_url}/task", headers=self.headers, json=payload)
-            r.raise_for_status()
-            return r.json()
-
-    async def get_status(self, task_id):
-        async with httpx.AsyncClient() as client:
-            r = await client.get(f"{self.base_url}/task/{task_id}", headers=self.headers)
-            r.raise_for_status()
-            return r.json()
-
-async def generate_images(prompt, image_ref):
-    api = MidjourneyAPI(MIDJOURNEY_API_KEY)
-    task = await api.create_task(prompt, image_ref)
-    task_id = task["data"]["task_id"]
-
-    # Poll until complete
-    import time
-    start = time.time()
-    while time.time() - start < 300:
-        status = await api.get_status(task_id)
-        if status["data"]["status"] == "completed":
-            return status["data"]["output"]["image_urls"]
-        elif status["data"]["status"] == "failed":
-            raise RuntimeError("Image generation failed")
-        await asyncio.sleep(5)
-    raise TimeoutError("Image generation timed out")
-
-# -------- Routes --------
+# ---- ROUTES ----
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
+        # Save user selfie
         selfie = request.files["face"]
         selfie_path = os.path.join(UPLOAD_FOLDER, selfie.filename)
         selfie.save(selfie_path)
 
-        # Call MidJourney with Omni Ref
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            image_urls = loop.run_until_complete(generate_images(BASE_PROMPT, selfie_path))
-        finally:
-            loop.close()
+        # Load face + logo
+        with open(selfie_path, "rb") as f:
+            face_data = f.read()
+        with open(LOGO_PATH, "rb") as f:
+            logo_data = f.read()
 
-        return render_template("result.html", images=image_urls)
+        # Prompt
+        prompt = (
+            "Generate an ultra-realistic cinematic image of a skydiver diving "
+            "from a jet painted in IndiGo Airlines livery. Use the provided face photo "
+            "for the diver's identity, and apply the IndiGo logo onto the airplane. "
+            "Show the diver mid-air, arms spread wide, with blue sky and clouds in the background."
+        )
+
+        # Call Gemini Flash 2.5 (Nano Banana)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[
+                prompt,
+                types.Part(inline_data=types.Blob(mime_type="image/png", data=face_data)),
+                types.Part(inline_data=types.Blob(mime_type="image/png", data=logo_data)),
+            ],
+        )
+
+        # Save result(s)
+        image_paths = []
+        i = 1
+        for part in response.candidates[0].content.parts:
+            if part.inline_data is not None:
+                img = Image.open(BytesIO(part.inline_data.data))
+                out_path = os.path.join(OUTPUT_FOLDER, f"indigo_{i}.png")
+                img.save(out_path)
+                image_paths.append(out_path)
+                i += 1
+
+        return render_template("result.html", images=image_paths)
 
     return render_template("index.html")
-
-if __name__ == "__main__":
-    app.run(debug=True)
